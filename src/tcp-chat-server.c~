@@ -1,0 +1,198 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+
+#define TRUE 1
+#define FALSE 0
+
+int main()
+{
+	/* define variables here */
+	int r, serverfd, clientfd, fd, max_connect, done;
+	struct addrinfo hints, *server;
+	const char *port="65001";
+	const int clientname_size = 32;
+	char clientname[clientname_size];
+	const int backlog = 10;
+	char buffer[BUFSIZ], resp[BUFSIZ];
+	char connection[backlog][clientname_size]; // A mapping of connection number/id to ip address
+
+	socklen_t address_len = sizeof(struct sockaddr);
+	struct sockaddr address;
+	const char *welcome_msg = "Type 'close' to disconnect; 'shutdown' to stop\n";
+
+	fd_set main_fd, read_fd;
+	/* setup the server */
+	memset(&hints, 0, sizeof(struct addrinfo));
+
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE;
+	r = getaddrinfo(0, port, &hints, &server);
+	if(r<0){
+		perror("Server error!\n");
+		exit(1);
+	}
+
+	/* create a socket */
+	serverfd = socket(server->ai_family, server->ai_socktype, server->ai_protocol);
+	if(serverfd==-1){
+		perror("Socket creation failed!\n");
+		exit(1);
+	}
+
+	/* bind to a port */
+	r = bind(serverfd, server->ai_addr, server->ai_addrlen);
+	if(r<0){
+		perror("Bind error!\n");
+		exit(1);
+	}
+	/* listen for a connection*/
+	puts("Chat Server is listening...");
+	r = listen(serverfd, max_connect);
+	if(r<0){
+		perror("Listen error!\n");
+		exit(1);
+	}
+
+	/* deal with multiple connections */
+	max_connect = backlog;							/* maximum connections */
+	FD_ZERO(&main_fd);							/* initialize file descriptor set */
+	FD_SET(serverfd, &main_fd);
+	
+	done = FALSE;							/* set the server's file descriptor */
+	/* endless loop to process the connections */
+	while(!done)
+	{
+		read_fd = main_fd;/* backup the main file descriptor set into a read set for processing */
+		
+		/* scan the connections for any activity */
+		r = select(max_connect+1, &read_fd, NULL, NULL, 0);
+		if(r<0){
+			perror("Scan failed!\n");
+			exit(1);
+		}
+		/* loop to check for active connections */
+		for(fd = 1; fd <= max_connect ; fd ++)
+		{
+			/* filter only active or new clients */
+			if(FD_ISSET(fd, &read_fd))
+			{
+				/* check the server for a new connection */
+				if(fd == serverfd)
+				{
+					/* add the new client */
+					clientfd = accept(serverfd, (struct sockaddr *)&address, &address_len);
+					if(clientfd==-1){
+						perror("Connection error!\n");
+						exit(1);
+					}
+					/* connection accepted, get IP address */
+					r = getnameinfo(&address, address_len, clientname, clientname_size, 0, 0, NI_NUMERICHOST);
+					if(r<0){
+						perror("Couldn't get client info!\n");
+						exit(1);
+					}
+					/* update array of IP addresses */
+					strcpy(connection[clientfd], clientname);
+					/* add new client socket to the file descriptor list */
+					FD_SET(clientfd, &main_fd);
+					/* welcome the new user: create welcome string and send */
+					strcpy(buffer, "SERVER> Welcome ");
+					strcat(buffer, connection[clientfd]);
+					strcat(buffer, " to the chat server\n");
+					strcat(buffer, welcome_msg);
+
+					/* welcome string: "SERVER> Welcome xxx.xxx.xxx.xxx to the chat server\n"
+					   "Type 'close' to disconnect; 'shtudown' to stop\n" */
+					send(clientfd, buffer, strlen(buffer), 0);
+					/* tell everyone else about the new user */
+					/* build the string: "SERVER> xxx.xxx.xxx.xxx has joined the server" */
+					strcpy(buffer, "SERVER> ");
+					strcat(buffer, connection[clientfd]);
+					strcat(buffer, " has joined the server\n");
+					/* loop from the server's file descriptor up,
+					   sending the string to each active connection */
+					for(int i=serverfd+1; i<max_connect;i++)
+					{
+						if(FD_ISSET(i, &main_fd))
+							send(i, buffer, strlen(buffer), 0);
+					}
+					/* output the string to the local console as well */
+					printf("%s", buffer);
+					
+				} /* end if to add new client */
+				/* deal with incoming data from an established connection */
+				else
+				{
+					/* check input buffer for the current fd */
+					r = recv(fd, buffer, BUFSIZ, 0);/* if nothing received, disconnect them */
+					
+					if(r==1 && buffer[0]=='\n')
+					{
+						FD_CLR(fd, &main_fd);							/* clear the file descriptor */
+						close(fd);							/* close the file descriptor/socket */
+						
+						/* tell others that the user has disconnected */
+						/* build the string: "SERVER> xxx.xxx.xxx.xxx, disconnected" */
+						strcpy(buffer, "SERVER> ");
+						strcat(buffer, connection[clientfd]);
+						strcat(buffer, ", disconnected\n");
+						/* loop through all connections (not the server) to send the string */
+						for(int i = serverfd+1; i<max_connect; i++)
+						{
+							if(FD_ISSET(i, &main_fd))
+							{
+								send(i, buffer, strlen(buffer), 0);
+							}
+						}
+						/* output the string locally */
+						printf("%s", buffer);
+					}
+					/* at this point, the connected client has text to share */
+					/* share the incoming text with all connections */
+					else
+					{
+						buffer[r] = '\0';							/* cap the received string */
+						/* first check to see whether the "shutdown\n" string was sent */
+						if(!strcmp(buffer, "shutdown\n"))
+						{
+							done = TRUE;				/* if so, set the loop's terminating condition */
+						}
+						/* otherwise, echo the received string to all connected fds */
+						else
+						{
+							/* build the string: "xxx.xxx.xxx.xxx> [text]" */
+							strcpy(resp,connection[fd]);
+							strcat(resp, "> ");
+							strcat(resp, buffer);
+							/* loop through all connections, but not the server */
+							for(int i=serverfd+1; i<max_connect ; i++)
+							{
+								/* check for an active file descriptor */
+								if(FD_ISSET(i,&main_fd))
+								{
+									/* send the built string */
+									send(i, resp, strlen(resp), 0);
+								}
+							}
+							/* echo the string to the server as well */
+							printf("%s", resp);
+						}	/* end else for connected client */
+					}	/* end else after disconnect */
+				} /* end else to send/recv from client(s) */
+			} /* end if */
+		} /* end for loop through connections */
+	} /* end while */
+
+	/* generate local message: "SERVER> Shutdown issued; cleaning up" */
+	puts("SERVER> Shutdown issued; cleaning up");
+	/* close the socket and free any allocated memory */
+	close(serverfd);
+	freeaddrinfo(server);
+	return(0);
+}
